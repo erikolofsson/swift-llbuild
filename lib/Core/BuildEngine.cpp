@@ -130,18 +130,26 @@ class BuildEngineImpl : public BuildDBDelegate {
     /// The rule making the request.
     RuleInfo* ruleInfo;
     /// The input index being considered.
-    unsigned inputIndex;
+    unsigned inputIndex = 0;
+    /// The input index that the below cache fields are valid for
+    unsigned cachedInputIndex = -1;
     /// The input being considered, if already looked up.
     ///
     /// This is used when a scan request is deferred waiting on its input to be
     /// scanned, to avoid a redundant hash lookup.
-    RuleInfo* inputRuleInfo;
-    /// Whether the rule is executed in order-only way.
-    bool orderOnly;
-    /// Whether the rule is cleaned from dependencies after execution.
+    RuleInfo* inputRuleInfo = nullptr;
+
+    /// The inputs that we are waiting for to finish for the current barrier
+    std::vector<unsigned> pendingInputs;
+
+    /// Whether the cached rule is executed in order-only way.
+    bool orderOnly = false;
+    /// Whether the cached rule is cleaned from dependencies after execution.
     bool singleUse = false;
+    /// Whether the rule scan request is already in the scan queue
+    bool isInScanQueue = true;
   };
-  std::vector<RuleScanRequest> ruleInfosToScan;
+  std::vector<std::shared_ptr<RuleScanRequest>> ruleInfosToScan;
 
   struct RuleScanRecord {
     /// The vector of paused input requests, waiting for the dependency scan on
@@ -149,7 +157,7 @@ class BuildEngineImpl : public BuildDBDelegate {
     std::vector<TaskInputRequest> pausedInputRequests;
     /// The vector of deferred scan requests, for rules which are waiting on
     /// this one to be scanned.
-    std::vector<RuleScanRequest> deferredScanRequests;
+    std::vector<std::shared_ptr<RuleScanRequest>> deferredScanRequests;
   };
 
   /// Wrapper for information specific to a single rule.
@@ -315,12 +323,17 @@ class BuildEngineImpl : public BuildDBDelegate {
     /// this one to be scanned.
     //
     // FIXME: As above, this structure has redundancy in it.
-    std::vector<RuleScanRequest> deferredScanRequests;
+    std::vector<std::shared_ptr<RuleScanRequest>> deferredScanRequests;
     /// The rule that this task is computing.
     RuleInfo* forRuleInfo = nullptr;
+    /// Used to sequence batches of inputs that can be scanned in parallel
+    std::atomic<unsigned> dependencyBatchSequence{0};
     /// The number of outstanding inputs that this task is waiting on to be
     /// provided.
     unsigned waitCount = 0;
+    /// Keep track of last dependency batch sequence to know when to insert
+    /// barriers in the rule info result
+    unsigned lastDependencyBatchSequence = 0;
     /// The list of discovered dependencies found during execution of the task.
     DependencyKeyIDs discoveredDependencies;
 
@@ -505,7 +518,7 @@ private:
       trace->ruleScheduledForScanning(ruleInfo.rule.get());
     ruleInfo.state = RuleInfo::StateKind::IsScanning;
     ruleInfo.setPendingScanRecord(newRuleScanRecord());
-    ruleInfosToScan.push_back({ &ruleInfo, /*InputIndex=*/0, nullptr, false });
+    ruleInfosToScan.push_back(std::make_shared<RuleScanRequest>(RuleScanRequest{ &ruleInfo }));
 
     return false;
   }
@@ -546,7 +559,7 @@ private:
 
     // register the task
     taskInfosMutex.lock();
-    auto result = taskInfos.emplace(task, TaskInfo(task));
+    auto result = taskInfos.emplace(std::piecewise_construct, std::forward_as_tuple(task), std::forward_as_tuple(task));
     assert(result.second && "task already registered");
     auto taskInfo = &(result.first)->second;
     taskInfosMutex.unlock();
@@ -596,7 +609,9 @@ private:
   ///
   /// This will process all of the inputs required by the requesting rule, in
   /// order, unless the scan needs to be deferred waiting for an input.
-  void processRuleScanRequest(RuleScanRequest request) {
+  void processRuleScanRequest(std::shared_ptr<RuleScanRequest> const &requestPtr) {
+    auto& request = *requestPtr;
+
     auto& ruleInfo = *request.ruleInfo;
 
     // With forced builds in cycle breaking, we may end up being asked to scan
@@ -605,14 +620,16 @@ private:
     if (!ruleInfo.isScanning())
       return;
 
-    // Process each of the remaining inputs.
-    do {
+    std::vector<unsigned> newPendingInputs;
+
+    auto processInput = [&](unsigned inputIndex) -> bool {
       // Look up the input rule info, if not yet cached.
-      if (!request.inputRuleInfo) {
-        const auto& keyAndFlag = ruleInfo.result.dependencies[request.inputIndex];
+      if (!request.inputRuleInfo || request.cachedInputIndex != inputIndex) {
+        const auto& keyAndFlag = ruleInfo.result.dependencies[inputIndex];
         request.inputRuleInfo = &getRuleInfoForKey(keyAndFlag.keyID);
         request.orderOnly = keyAndFlag.orderOnly;
         request.singleUse = keyAndFlag.singleUse;
+        request.cachedInputIndex = inputIndex;
       }
 
       auto& inputRuleInfo = *request.inputRuleInfo;
@@ -627,8 +644,10 @@ private:
           trace->ruleScanningDeferredOnInput(ruleInfo.rule.get(),
                                              inputRuleInfo.rule.get());
         inputRuleInfo.getPendingScanRecord()
-          ->deferredScanRequests.push_back(request);
-        return;
+          ->deferredScanRequests.push_back(requestPtr);
+
+        newPendingInputs.push_back(inputIndex);
+        return false;
       }
 
       if (trace)
@@ -639,17 +658,16 @@ private:
 
       // If the input isn't already available, enqueue this scan request on the
       // input.
-      //
-      // FIXME: We need to continue scanning the rest of the inputs to ensure we
-      // are not delaying necessary work. See <rdar://problem/20248283>.
       if (!isAvailable) {
         if (trace)
           trace->ruleScanningDeferredOnTask(
             ruleInfo.rule.get(), inputRuleInfo.getPendingTaskInfo()->task.get());
         assert(inputRuleInfo.isInProgress());
         inputRuleInfo.getPendingTaskInfo()->
-            deferredScanRequests.push_back(request);
-        return;
+            deferredScanRequests.push_back(requestPtr);
+
+        newPendingInputs.push_back(inputIndex);
+        return false;
       }
 
       if (request.orderOnly) {
@@ -664,16 +682,47 @@ private:
               ruleInfo.rule.get(), inputRuleInfo.rule.get());
           finishScanRequest(ruleInfo, RuleInfo::StateKind::NeedsToRun);
           delegate.determinedRuleNeedsToRun(ruleInfo.rule.get(), Rule::RunReason::InputRebuilt, inputRuleInfo.rule.get());
-          return;
+          return true;
         }
       }
 
-      // Otherwise, increment the scan index.
-      ++request.inputIndex;
-      request.inputRuleInfo = nullptr;
-      request.orderOnly = false;
-      request.singleUse = false;
-    } while (request.inputIndex != ruleInfo.result.dependencies.size());
+      return false;
+    };
+
+    // Process each of the pending inputs for this depenency barrier.
+    for (auto& pendingInput : request.pendingInputs) {
+      if (processInput(pendingInput))
+        return;
+    }
+
+    // If there are inputs still pending we need to wait for them
+    if (!newPendingInputs.empty()) {
+      request.pendingInputs = std::move(newPendingInputs);
+      return;
+    }
+
+    // Process each of the remaining inputs from one dependency barrier.
+    if (request.inputIndex != ruleInfo.result.dependencies.size()) {
+      do {
+        if (ruleInfo.result.dependencies[request.inputIndex].isBarrier()) {
+          ++request.inputIndex;
+          if (newPendingInputs.empty())
+            continue; // Skip to next dependency barrier if current is ready
+          else
+            break;
+        }
+
+        if (processInput(request.inputIndex))
+          return;
+
+        ++request.inputIndex;
+      } while (request.inputIndex != ruleInfo.result.dependencies.size());
+    }
+
+    request.pendingInputs = std::move(newPendingInputs);
+
+    if (!request.pendingInputs.empty())
+      return;
 
     // If we reached the end of the inputs, the rule does not need to run.
     if (trace)
@@ -687,8 +736,14 @@ private:
     auto scanRecord = inputRuleInfo.getPendingScanRecord();
 
     // Wake up all of the pending scan requests.
-    for (const auto& request: scanRecord->deferredScanRequests) {
-      ruleInfosToScan.push_back(request);
+    for (auto& requestPointer: scanRecord->deferredScanRequests) {
+      auto& request = *requestPointer;
+      if (!request.isInScanQueue && request.ruleInfo->isScanning()) {
+        request.isInScanQueue = true;
+        ruleInfosToScan.push_back(std::move(requestPointer));
+      } else {
+        requestPointer.reset();
+      }
     }
 
     // Wake up all of the input requests on this rule.
@@ -750,8 +805,9 @@ private:
 
         didWork = true;
 
-        auto request = ruleInfosToScan.back();
+        auto request = std::move(ruleInfosToScan.back());
         ruleInfosToScan.pop_back();
+        request->isInScanQueue = false;
 
         processRuleScanRequest(request);
       }
@@ -834,9 +890,17 @@ private:
         // NOTE: In order to achieve the latter, we rely processing input
         // requests in FIFO order.
         //
-        request.taskInfo->forRuleInfo->result.dependencies.push_back(
-            request.inputRuleInfo->keyID, request.orderOnly, request.singleUse);
 
+        RuleInfo* ruleInfo = request.taskInfo->forRuleInfo;
+
+        unsigned sequence = request.taskInfo->dependencyBatchSequence.load();
+        if (sequence != request.taskInfo->lastDependencyBatchSequence) {
+          request.taskInfo->lastDependencyBatchSequence = sequence;
+          ruleInfo->result.dependencies.addBarrier();
+        }
+
+        ruleInfo->result.dependencies.push_back(
+            request.inputRuleInfo->keyID, request.orderOnly, request.singleUse);
 
         // If the rule is already available, enqueue the finalize request.
         if (isAvailable) {
@@ -880,6 +944,15 @@ private:
         } else {
           TracingEngineTaskCallback i(EngineTaskCallbackKind::ProvideValue, request.inputRuleInfo->keyID);
           TaskInterface iface{this, request.taskInfo->task.get()};
+
+          // When we provide a value to the task the task can make decisions
+          // that are dependent on the inputs in the previous sequenced dependency
+          // batch.
+          //
+          // Switching to a new batch makes sure that incremental builds
+          // will mimic this behavior when scanning dependencies.
+          request.taskInfo->dependencyBatchSequence.fetch_add(1);
+
           request.taskInfo->task->provideValue(
               iface, request.inputID, request.inputRuleInfo->result.value);
         }
@@ -964,7 +1037,10 @@ private:
         // FIXME: We could audit these dependencies at this point to verify that
         // they are not keys for rules which have not been run, which would
         // indicate an underspecified build (e.g., a generated header).
-        ruleInfo->result.dependencies.append(taskInfo->discoveredDependencies);
+        if (!taskInfo->discoveredDependencies.empty()) {
+          ruleInfo->result.dependencies.addBarrier();
+          ruleInfo->result.dependencies.append(taskInfo->discoveredDependencies);
+        }
 
         // Push back dummy input requests for any discovered dependencies, which
         // must be at least built in order to be brought up-to-date.
@@ -1000,8 +1076,14 @@ private:
         }
 
         // Wake up all of the pending scan requests.
-        for (const auto& request: taskInfo->deferredScanRequests) {
-          ruleInfosToScan.push_back(request);
+        for (auto& requestPointer: taskInfo->deferredScanRequests) {
+          auto& request = *requestPointer;
+          if (!request.isInScanQueue && request.ruleInfo->isScanning()) {
+            request.isInScanQueue = true;
+            ruleInfosToScan.push_back(std::move(requestPointer));
+          } else {
+            requestPointer.reset();
+          }
         }
 
         // Push all pending input requests onto the work queue.
@@ -1107,7 +1189,7 @@ private:
       }
       for (const auto& request: taskInfo.deferredScanRequests) {
         // Add the sucessor for the deferred relationship itself.
-        successors.push_back(request.ruleInfo->rule.get());
+        successors.push_back(request->ruleInfo->rule.get());
       }
       successorGraph.insert({ taskInfo.forRuleInfo->rule.get(), successors });
     }
@@ -1144,14 +1226,15 @@ private:
 
       // Process the deferred scan requests.
       for (const auto& request: record->deferredScanRequests) {
+        const auto &ruleInfo = *request->ruleInfo;
         // Add the sucessor for the deferred relationship itself.
-        successorGraph[request.inputRuleInfo->rule.get()].push_back(request.ruleInfo->rule.get());
+        successorGraph[request->inputRuleInfo->rule.get()].push_back(ruleInfo.rule.get());
 
         // Add the active rule scan record which needs to be traversed.
-        assert(request.ruleInfo->isScanning() || request.ruleInfo->wasForced);
-        if (request.ruleInfo->isScanning()) {
+        assert(ruleInfo.isScanning() || ruleInfo.wasForced);
+        if (ruleInfo.isScanning()) {
           activeRuleScanRecords.push_back(
-            request.ruleInfo->getPendingScanRecord());
+            ruleInfo.getPendingScanRecord());
         }
       }
     }
@@ -1292,10 +1375,10 @@ private:
   }
 
   // Helper function for breakCycle, finds a rule in a RuleScanRequest vector
-  std::vector<RuleScanRequest>::iterator findRuleScanRequestForRule(
-    std::vector<RuleScanRequest>& requests, RuleInfo* ruleInfo) {
+  std::vector<std::shared_ptr<RuleScanRequest>>::iterator findRuleScanRequestForRule(
+    std::vector<std::shared_ptr<RuleScanRequest>>& requests, RuleInfo* ruleInfo) {
     for (auto it = requests.begin(); it != requests.end(); it++) {
-      if (it->ruleInfo == ruleInfo) {
+      if ((*it)->ruleInfo == ruleInfo) {
         return it;
       }
     }
@@ -1458,7 +1541,7 @@ public:
   }
 
   RuleInfo& addRule(KeyID keyID, std::unique_ptr<Rule>&& rule) {
-    auto result = ruleInfos.emplace(keyID, RuleInfo(keyID, std::move(rule)));
+    auto result = ruleInfos.emplace(std::piecewise_construct, std::forward_as_tuple(keyID), std::forward_as_tuple(keyID, std::move(rule)));
     if (!result.second) {
       RuleInfo& ruleInfo = result.first->second;
       delegate.error("attempt to register duplicate rule \"" + ruleInfo.rule->key.str() + "\"\n");
@@ -1692,9 +1775,13 @@ public:
     for (const auto& ruleInfo: orderedRuleInfos) {
       fprintf(fp, "\"%s\"\n", ruleInfo->rule->key.c_str());
       for (auto keyIDAndFlag: ruleInfo->result.dependencies) {
-        const auto& dependency = getRuleInfoForKey(keyIDAndFlag.keyID);
-        fprintf(fp, "\"%s\" -> \"%s\"\n", ruleInfo->rule->key.c_str(),
-                dependency.rule->key.c_str());
+        if (keyIDAndFlag.isBarrier()) {
+          fprintf(fp, "\"%s\" -> \"BARRIER\"\n", ruleInfo->rule->key.c_str());
+        } else {
+          const auto& dependency = getRuleInfoForKey(keyIDAndFlag.keyID);
+          fprintf(fp, "\"%s\" -> \"%s\"\n", ruleInfo->rule->key.c_str(),
+                  dependency.rule->key.c_str());
+        }
       }
       fprintf(fp, "\n");
     }
