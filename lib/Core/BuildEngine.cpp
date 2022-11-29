@@ -111,6 +111,8 @@ class BuildEngineImpl : public BuildDBDelegate {
     uintptr_t inputID;
     /// The rule for the input which was requested.
     RuleInfo* inputRuleInfo;
+    /// The dependency batch sequence when the input was requested
+    unsigned dependencyBatchSequence = 0;
     /// Whether this rule is to be executed as order-only.
     bool orderOnly = false;
     /// Force the use of a prior value
@@ -794,7 +796,7 @@ private:
     finishedInputRequests.clear();
 
     // Push a dummy input request for the rule to build.
-    inputRequests.push_back({ nullptr, 0, &getRuleInfoForKey(buildKey), false, false, false });
+    inputRequests.push_back({ nullptr, 0, &getRuleInfoForKey(buildKey), 0, false, false, false });
 
     // Process requests as long as we have work to do.
     while (true) {
@@ -904,9 +906,8 @@ private:
 
         RuleInfo* ruleInfo = request.taskInfo->forRuleInfo;
 
-        unsigned sequence = request.taskInfo->dependencyBatchSequence.load();
-        if (sequence != request.taskInfo->lastDependencyBatchSequence) {
-          request.taskInfo->lastDependencyBatchSequence = sequence;
+        if (request.dependencyBatchSequence != request.taskInfo->lastDependencyBatchSequence) {
+          request.taskInfo->lastDependencyBatchSequence = request.dependencyBatchSequence;
           ruleInfo->result.dependencies.addBarrier();
         }
 
@@ -1063,7 +1064,7 @@ private:
         {
           std::lock_guard<std::mutex> guard(inputRequestsMutex);
           for (auto dependency: taskInfo->discoveredDependencies) {
-            inputRequests.push_back({ nullptr, 0, &getRuleInfoForKey(dependency.keyID), dependency.orderOnly, false , dependency.singleUse});
+            inputRequests.push_back({ nullptr, 0, &getRuleInfoForKey(dependency.keyID), 0, dependency.orderOnly, false , dependency.singleUse});
           }
         }
 
@@ -1814,7 +1815,7 @@ public:
     RuleInfo* ruleInfo = &getRuleInfoForKey(key);
 
     std::lock_guard<std::mutex> guard(inputRequestsMutex);
-    inputRequests.push_back({ taskInfo, inputID, ruleInfo, orderOnly, false, singleUse });
+    inputRequests.push_back({ taskInfo, inputID, ruleInfo, taskInfo->dependencyBatchSequence.load(), orderOnly, false, singleUse });
     taskInfo->waitCount++;
   }
 
