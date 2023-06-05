@@ -413,7 +413,7 @@ commands:
     // FIXME: This build graph triggers degenerate build behavior. Due to the
     // way we scan tasks, we end up waiting for the first task to resolve before
     // we unlock the other two branches to run in parallel.
-    ASSERT_EQ(delegate.maxTaskParallism(), std::min(2, (int)std::thread::hardware_concurrency()));
+    ASSERT_EQ(delegate.maxTaskParallism(), std::min(3, (int)std::thread::hardware_concurrency()));
   }
 }
 

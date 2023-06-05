@@ -66,6 +66,7 @@ namespace {
 
 class SQLiteBuildDB : public BuildDB {
   /// Version History:
+  /// * 18: Add barriers in dependency list.
   /// * 17: Revert 15
   /// * 16: Add checksum field to FileInfo.
   /// * 15: Add barriers in dependency list.
@@ -80,7 +81,7 @@ class SQLiteBuildDB : public BuildDB {
   /// * 6: Added `ordinal` field for dependencies.
   /// * 5: Switched to using `WITHOUT ROWID` for dependencies.
   /// * 4: Pre-history
-  static const int currentSchemaVersion = 17;
+  static const int currentSchemaVersion = 18;
 
   std::string path;
   uint32_t clientSchemaVersion;
@@ -570,9 +571,14 @@ public:
 
       // Map the database key ID into an engine key ID (note that we already
       // hold the dbMutex at this point as required by getKeyIDforID())
-      KeyID keyID = getKeyIDForID(dbKeyID, error_out);
-      if (!error_out->empty()) {
-        return false;
+      KeyID keyID;
+      if (dbKeyID.value == 0)
+        keyID = KeyID::novalue();
+      else {
+        keyID = getKeyIDForID(dbKeyID, error_out);
+        if (!error_out->empty()) {
+          return false;
+        }
       }
       result_out->dependencies.set(i, keyID, orderOnly, singleUse);
     }
@@ -626,9 +632,15 @@ public:
       // FIXME: This is naively mapping all keys with no caching at this point,
       // thus likely to perform poorly.  Should refactor this into a bulk
       // query or a DB layer cache.
-      auto dbKeyID = getKeyID(dependency.keyID, error_out);
-      if (!error_out->empty()) {
-        return false;
+      DBKeyID dbKeyID;
+
+      if (dependency.isBarrier())
+        dbKeyID = DBKeyID(0);
+      else {
+        dbKeyID = getKeyID(dependency.keyID, error_out);
+        if (!error_out->empty()) {
+          return false;
+        }
       }
       encoder.write((dbKeyID.value << 2) + (dependency.singleUse << 1) + dependency.orderOnly);
     }
@@ -791,9 +803,14 @@ public:
         
         // Map the database key ID into an engine key ID (note that we already
         // hold the dbMutex at this point as required by getKeyIDforID())
-        KeyID keyID = getKeyIDForID(dbKeyID, error_out);
-        if (!error_out->empty()) {
-          return false;
+        KeyID keyID;
+        if (dbKeyID.value == 0)
+          keyID = KeyID::novalue();
+        else {
+          keyID = getKeyIDForID(dbKeyID, error_out);
+          if (!error_out->empty()) {
+            return false;
+          }
         }
         result.dependencies.set(i, keyID, orderOnly, singleUse);
       }
